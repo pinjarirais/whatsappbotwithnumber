@@ -21,6 +21,8 @@ app.use(cors());
 let sock;
 let latestQR = null;
 let ocrWorker;
+let pairingCode = null;
+let isConnecting = false;
 
 /* =========================
    CONFIG
@@ -32,20 +34,23 @@ const BOT_NUMBER_FALLBACKS = ["65559051915364"];
 const BOT_COMMANDS = ["/bot", "!bot"];
 
 /* =========================
-   LANGUAGE DETECTION
-========================= */
-function detectLanguage(text) {
-  const hindiRegex = /[\u0900-\u097F]/; // Hindi Unicode range
-  if (hindiRegex.test(text)) return "hi";
-  return "en";
-}
-
-/* =========================
-   QUEUE SYSTEM (FIFO)
+   MEMORY STORES
 ========================= */
 const chatQueues = new Map();
 const chatBusy = new Set();
+const conversationState = new Map();
 
+/* =========================
+   LANGUAGE DETECTION
+========================= */
+function detectLanguage(text) {
+  const hindiRegex = /[\u0900-\u097F]/;
+  return hindiRegex.test(text) ? "hi" : "en";
+}
+
+/* =========================
+   FIFO QUEUE
+========================= */
 async function processInQueue(remoteJid, taskFn) {
   const lastPromise = chatQueues.get(remoteJid) || Promise.resolve();
 
@@ -68,19 +73,21 @@ async function processInQueue(remoteJid, taskFn) {
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
 
-  console.log("🔤 Initializing OCR Worker (eng + hin)...");
-  ocrWorker = await createWorker("eng+hin");
-
-  await ocrWorker.setParameters({
-    tessedit_pageseg_mode: 6,
-  });
+  try {
+    if (!ocrWorker) {
+      console.log("🔤 Initializing OCR Worker...");
+      ocrWorker = await createWorker("eng+hin");
+      await ocrWorker.setParameters({ tessedit_pageseg_mode: 6 });
+    }
+  } catch (err) {
+    console.log("❌ OCR Worker Init Failed:", err.message);
+  }
 
   sock = makeWASocket({
     auth: state,
     logger: P({ level: "silent" }),
     printQRInTerminal: false,
     browser: ["Windows", "Chrome", "10"],
-    syncFullHistory: false,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -106,6 +113,7 @@ async function startWhatsApp() {
     if (connection === "open") {
       console.log("✅ WhatsApp CONNECTED:", sock.user?.id);
       latestQR = null;
+      pairingCode = null;
     }
   });
 
@@ -121,12 +129,88 @@ async function startWhatsApp() {
     const remoteJid = msg.key.remoteJid;
     const isGroup = remoteJid.endsWith("@g.us");
 
+    const text =
+      msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+
+    const lowerText = text.toLowerCase().trim();
+
+    const isYes = /^(yes|ha|haan|ok|okay|sure|hmm)$/i.test(lowerText);
+    const isNo = /^(no|nahi|na|cancel)$/i.test(lowerText);
+
     /* =========================
-       IMAGE MESSAGE HANDLING
+       CONFIRMATION HANDLING
+    ========================= */
+    if (conversationState.has(remoteJid)) {
+      const state = conversationState.get(remoteJid);
+
+      if (isYes) {
+        conversationState.delete(remoteJid);
+        console.log("✅ User confirmed");
+
+        await processInQueue(remoteJid, async () => {
+          chatBusy.add(remoteJid);
+
+          try {
+            await sock.sendPresenceUpdate("composing", remoteJid);
+
+            const response = await fetch(N8N_WEBHOOK_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                message: state.originalQuestion,
+                type: "text",
+                language: detectLanguage(state.originalQuestion),
+                isGroup,
+                confirmed: true,
+              }),
+            });
+
+            if (!response.ok)
+              throw new Error(`Webhook HTTP ${response.status}`);
+
+            const raw = await response.text();
+            const data = raw ? JSON.parse(raw) : {};
+
+            await sock.sendMessage(remoteJid, {
+              text: data.reply || data.output || "🤖 No response.",
+            });
+          } catch {
+            await sock.sendMessage(remoteJid, {
+              text: "⚠️ Confirmation failed.",
+            });
+          } finally {
+            chatBusy.delete(remoteJid);
+          }
+        });
+
+        return;
+      }
+
+      if (isNo) {
+        conversationState.delete(remoteJid);
+
+        await sock.sendMessage(remoteJid, {
+          text: "👍 Okay, cancelled.",
+        });
+
+        return;
+      }
+
+      /* ✅ AUTO CLEAR IF NEW QUERY */
+      if (!isYes && !isNo && text.trim().length > 3) {
+        console.log("🧹 New query detected → Clearing old confirmation");
+        conversationState.delete(remoteJid);
+      }
+    }
+
+    /* =========================
+       IMAGE HANDLING
     ========================= */
     if (msg.message.imageMessage) {
       if (chatBusy.has(remoteJid)) {
-        await sock.sendMessage(remoteJid, { text: "⏳ Please wait..." });
+        await sock.sendMessage(remoteJid, {
+          text: "⏳ Processing previous request...",
+        });
         return;
       }
 
@@ -143,54 +227,39 @@ async function startWhatsApp() {
             { logger: P({ level: "silent" }) },
           );
 
-          console.log("🖼 Image received → Running OCR (worker)...");
-
           const {
             data: { text },
           } = await ocrWorker.recognize(buffer);
 
           const extractedText = text.trim();
-          const detectedLang = detectLanguage(extractedText);
 
-          console.log("📄 OCR Text:", extractedText);
-          console.log("🌐 Detected Language:", detectedLang);
+          if (!extractedText) {
+            await sock.sendMessage(remoteJid, {
+              text: "⚠️ No readable text found in image.",
+            });
+            return;
+          }
 
           const response = await fetch(N8N_WEBHOOK_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              message:
-                extractedText ||
-                msg.message.imageMessage.caption ||
-                "No text found in image",
+              message: extractedText,
               type: "image",
-              language: detectedLang,
+              language: detectLanguage(extractedText),
               isGroup,
             }),
           });
 
-          if (!response.ok) {
-  throw new Error(`Webhook HTTP ${response.status}`);
-}
+          if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
 
-          let data;
-
-          try {
-            const raw = await response.text();
-            console.log("📡 n8n Raw Response:", raw);
-
-            data = raw ? JSON.parse(raw) : {};
-          } catch (err) {
-            console.log("❌ Webhook JSON Parse Error:", err.message);
-            data = {};
-          }
+          const raw = await response.text();
+          const data = raw ? JSON.parse(raw) : {};
 
           await sock.sendMessage(remoteJid, {
-            text: data.reply || data.output || "🤖 No response generated.",
+            text: data.reply || data.output || "🤖 No response.",
           });
-        } catch (err) {
-          console.log("❌ OCR Error:", err.message);
-
+        } catch {
           await sock.sendMessage(remoteJid, {
             text: "⚠️ Image OCR failed.",
           });
@@ -202,26 +271,23 @@ async function startWhatsApp() {
       return;
     }
 
-    /* =========================
-       TEXT MESSAGE HANDLING
-    ========================= */
-    const text =
-      msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-
     if (!text) return;
 
-    const lowerText = text.toLowerCase();
+    /* =========================
+       TEXT HANDLING
+    ========================= */
+    const lowerFullText = text.toLowerCase();
 
     const nameMentioned = BOT_NAMES.some((name) =>
-      lowerText.includes("@" + name),
+      lowerFullText.includes("@" + name),
     );
 
     const numberMentioned = BOT_NUMBER_FALLBACKS.some((num) =>
-      lowerText.includes("@" + num),
+      lowerFullText.includes("@" + num),
     );
 
     const commandTriggered = BOT_COMMANDS.some((cmd) =>
-      lowerText.startsWith(cmd),
+      lowerFullText.startsWith(cmd),
     );
 
     const isBotTriggered = nameMentioned || numberMentioned || commandTriggered;
@@ -229,7 +295,6 @@ async function startWhatsApp() {
     if (isGroup && !isBotTriggered) return;
 
     let cleanText = text.replace(/@\S+/g, "");
-
     BOT_COMMANDS.forEach((cmd) => {
       cleanText = cleanText.replace(new RegExp("^" + cmd, "i"), "");
     });
@@ -238,7 +303,9 @@ async function startWhatsApp() {
     if (!cleanText) return;
 
     if (chatBusy.has(remoteJid)) {
-      await sock.sendMessage(remoteJid, { text: "⏳ Please wait..." });
+      await sock.sendMessage(remoteJid, {
+        text: "⏳ Processing previous request...",
+      });
       return;
     }
 
@@ -259,12 +326,29 @@ async function startWhatsApp() {
           }),
         });
 
-        const data = await response.json();
+        if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
 
-        await sock.sendMessage(remoteJid, {
-          text: data.reply || data.output || "🤖 No response generated.",
-        });
-      } catch (err) {
+        const raw = await response.text();
+        const data = raw ? JSON.parse(raw) : {};
+
+        const botReply =
+          data.reply || data.output || "🤖 No response generated.";
+
+        if (
+          botReply.toLowerCase().includes("would you like") ||
+          botReply.toLowerCase().includes("do you want") ||
+          botReply.toLowerCase().includes("should i") ||
+          botReply.toLowerCase().includes("can i")
+        ) {
+          conversationState.set(remoteJid, {
+            originalQuestion: cleanText,
+          });
+
+          console.log("🧠 Confirmation state saved");
+        }
+
+        await sock.sendMessage(remoteJid, { text: botReply });
+      } catch {
         await sock.sendMessage(remoteJid, {
           text: "⚠️ Something went wrong.",
         });
@@ -291,14 +375,87 @@ app.get("/status", (req, res) => {
 app.get("/qr", (req, res) => {
   if (sock?.user) return res.send("✅ Already connected");
   if (!latestQR) return res.send("⏳ QR not generated yet...");
-  res.send(`<img src="${latestQR}" />`);
+  res.send(`<img src="${latestQR}" width="250"/>`);
+});
+
+app.post("/pair", async (req, res) => {
+  try {
+    const { number } = req.body;
+
+    if (!number) return res.status(400).json({ error: "Number required" });
+
+    if (sock?.user) return res.json({ message: "Already connected" });
+
+    pairingCode = await sock.requestPairingCode(number);
+
+    res.json({ success: true, pairingCode });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   PAIR UI
+========================= */
+app.get("/pair-ui", (req, res) => {
+  res.send(`
+    <h2>📲 WhatsApp Connection</h2>
+
+    <h3>Scan QR</h3>
+    <iframe src="/qr" width="260" height="260"></iframe>
+
+    <h3>OR Pair via Mobile Number</h3>
+    <input id="number" placeholder="919876543210"/>
+    <button id="pairBtn" onclick="pair()">Get Pairing Code</button>
+
+    <h3 id="status"></h3>
+
+    <pre id="result"></pre>
+
+    <script>
+      async function checkStatus() {
+        const res = await fetch('/status');
+        const data = await res.json();
+
+        const btn = document.getElementById('pairBtn');
+        const status = document.getElementById('status');
+
+        if (data.connected) {
+          btn.disabled = true;
+          btn.innerText = "✅ Connected";
+          status.innerText = "Connected as: " + data.user;
+        } else {
+          btn.disabled = false;
+          btn.innerText = "Get Pairing Code";
+          status.innerText = "❌ Not Connected";
+        }
+      }
+
+      async function pair() {
+        const number = document.getElementById("number").value;
+
+        const res = await fetch("/pair", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ number })
+        });
+
+        const data = await res.json();
+        document.getElementById("result").innerText =
+          JSON.stringify(data, null, 2);
+      }
+
+      checkStatus();
+      setInterval(checkStatus, 2000); // auto refresh
+    </script>
+  `);
 });
 
 /* =========================
    CLEAN SHUTDOWN
 ========================= */
 process.on("SIGINT", async () => {
-  console.log("🛑 Closing OCR Worker...");
+  console.log("🛑 Shutting down...");
   if (ocrWorker) await ocrWorker.terminate();
   process.exit(0);
 });
@@ -307,5 +464,5 @@ process.on("SIGINT", async () => {
    START SERVER
 ========================= */
 app.listen(3000, () => {
-  console.log("🚀 Server running → http://localhost:3000/pair-ui");
+  console.log("🚀 Open → http://localhost:3000/pair-ui");
 });
