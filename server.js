@@ -27,7 +27,7 @@ let isConnecting = false;
 /* =========================
    CONFIG
 ========================= */
-const N8N_WEBHOOK_URL = "https://pinjarin8n.app.n8n.cloud/webhook/whatsapp-rag";
+const N8N_WEBHOOK_URL = "https://raisn8n.app.n8n.cloud/webhook/whatsapp-rag";
 
 const BOT_NAMES = ["yesbank bot", "yes bank bot", "ai response"];
 const BOT_NUMBER_FALLBACKS = ["65559051915364"];
