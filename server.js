@@ -22,12 +22,12 @@ let sock;
 let latestQR = null;
 let ocrWorker;
 let pairingCode = null;
-let isConnecting = false;
 
 /* =========================
    CONFIG
 ========================= */
-const N8N_WEBHOOK_URL = "https://raisn8n.app.n8n.cloud/webhook/whatsapp-rag";
+const N8N_WEBHOOK_URL =
+  "https://raisn8n.app.n8n.cloud/webhook/whatsapp-rag";
 
 const BOT_NAMES = ["yesbank bot", "yes bank bot", "ai response"];
 const BOT_NUMBER_FALLBACKS = ["65559051915364"];
@@ -65,6 +65,42 @@ async function processInQueue(remoteJid, taskFn) {
 
   chatQueues.set(remoteJid, nextPromise);
   return nextPromise;
+}
+
+/* =========================
+   WAIT FOR SOCKET READY ✅ FIX
+========================= */
+function waitForSocketReady(timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+
+    const check = () => {
+      if (sock?.ws?.readyState === 1) {
+        return resolve(true);
+      }
+
+      if (Date.now() - start > timeout) {
+        return reject(new Error("Socket connection timeout"));
+      }
+
+      setTimeout(check, 200);
+    };
+
+    check();
+  });
+}
+
+/* =========================
+   SAFE JSON PARSE
+========================= */
+async function safeParseResponse(response) {
+  const raw = await response.text();
+
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return { reply: raw };
+  }
 }
 
 /* =========================
@@ -130,7 +166,9 @@ async function startWhatsApp() {
     const isGroup = remoteJid.endsWith("@g.us");
 
     const text =
-      msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      "";
 
     const lowerText = text.toLowerCase().trim();
 
@@ -145,7 +183,6 @@ async function startWhatsApp() {
 
       if (isYes) {
         conversationState.delete(remoteJid);
-        console.log("✅ User confirmed");
 
         await processInQueue(remoteJid, async () => {
           chatBusy.add(remoteJid);
@@ -168,8 +205,7 @@ async function startWhatsApp() {
             if (!response.ok)
               throw new Error(`Webhook HTTP ${response.status}`);
 
-            const raw = await response.text();
-            const data = raw ? JSON.parse(raw) : {};
+            const data = await safeParseResponse(response);
 
             await sock.sendMessage(remoteJid, {
               text: data.reply || data.output || "🤖 No response.",
@@ -188,17 +224,11 @@ async function startWhatsApp() {
 
       if (isNo) {
         conversationState.delete(remoteJid);
-
-        await sock.sendMessage(remoteJid, {
-          text: "👍 Okay, cancelled.",
-        });
-
+        await sock.sendMessage(remoteJid, { text: "👍 Okay, cancelled." });
         return;
       }
 
-      /* ✅ AUTO CLEAR IF NEW QUERY */
       if (!isYes && !isNo && text.trim().length > 3) {
-        console.log("🧹 New query detected → Clearing old confirmation");
         conversationState.delete(remoteJid);
       }
     }
@@ -207,6 +237,13 @@ async function startWhatsApp() {
        IMAGE HANDLING
     ========================= */
     if (msg.message.imageMessage) {
+      if (!ocrWorker) {
+        await sock.sendMessage(remoteJid, {
+          text: "⚠️ OCR engine not available.",
+        });
+        return;
+      }
+
       if (chatBusy.has(remoteJid)) {
         await sock.sendMessage(remoteJid, {
           text: "⏳ Processing previous request...",
@@ -224,7 +261,7 @@ async function startWhatsApp() {
             msg,
             "buffer",
             {},
-            { logger: P({ level: "silent" }) },
+            { logger: P({ level: "silent" }) }
           );
 
           const {
@@ -251,10 +288,10 @@ async function startWhatsApp() {
             }),
           });
 
-          if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
+          if (!response.ok)
+            throw new Error(`Webhook HTTP ${response.status}`);
 
-          const raw = await response.text();
-          const data = raw ? JSON.parse(raw) : {};
+          const data = await safeParseResponse(response);
 
           await sock.sendMessage(remoteJid, {
             text: data.reply || data.output || "🤖 No response.",
@@ -279,18 +316,19 @@ async function startWhatsApp() {
     const lowerFullText = text.toLowerCase();
 
     const nameMentioned = BOT_NAMES.some((name) =>
-      lowerFullText.includes("@" + name),
+      lowerFullText.includes("@" + name)
     );
 
     const numberMentioned = BOT_NUMBER_FALLBACKS.some((num) =>
-      lowerFullText.includes("@" + num),
+      lowerFullText.includes("@" + num)
     );
 
     const commandTriggered = BOT_COMMANDS.some((cmd) =>
-      lowerFullText.startsWith(cmd),
+      lowerFullText.startsWith(cmd)
     );
 
-    const isBotTriggered = nameMentioned || numberMentioned || commandTriggered;
+    const isBotTriggered =
+      nameMentioned || numberMentioned || commandTriggered;
 
     if (isGroup && !isBotTriggered) return;
 
@@ -326,25 +364,20 @@ async function startWhatsApp() {
           }),
         });
 
-        if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
+        if (!response.ok)
+          throw new Error(`Webhook HTTP ${response.status}`);
 
-        const raw = await response.text();
-        const data = raw ? JSON.parse(raw) : {};
+        const data = await safeParseResponse(response);
 
         const botReply =
           data.reply || data.output || "🤖 No response generated.";
 
-        if (
-          botReply.toLowerCase().includes("would you like") ||
-          botReply.toLowerCase().includes("do you want") ||
-          botReply.toLowerCase().includes("should i") ||
-          botReply.toLowerCase().includes("can i")
-        ) {
+          console.log("BOT REPLY:", botReply);
+
+        if (/would you like|do you want|should i|can i/i.test(botReply)) {
           conversationState.set(remoteJid, {
             originalQuestion: cleanText,
           });
-
-          console.log("🧠 Confirmation state saved");
         }
 
         await sock.sendMessage(remoteJid, { text: botReply });
@@ -378,19 +411,46 @@ app.get("/qr", (req, res) => {
   res.send(`<img src="${latestQR}" width="250"/>`);
 });
 
+/* =========================
+   PAIR ROUTE ✅ FIXED
+========================= */
 app.post("/pair", async (req, res) => {
   try {
     const { number } = req.body;
 
-    if (!number) return res.status(400).json({ error: "Number required" });
+    if (!number)
+      return res.status(400).json({
+        success: false,
+        error: "Number required",
+      });
 
-    if (sock?.user) return res.json({ message: "Already connected" });
+    if (!sock)
+      return res.status(500).json({
+        success: false,
+        error: "Socket not initialized",
+      });
 
-    pairingCode = await sock.requestPairingCode(number);
+    if (sock?.user)
+      return res.json({
+        success: false,
+        message: "Already connected",
+      });
 
-    res.json({ success: true, pairingCode });
+    await waitForSocketReady(); // ✅ WAIT instead of error
+
+    const code = await sock.requestPairingCode(number);
+
+    res.json({
+      success: true,
+      pairingCode: code,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Pair Error:", err);
+
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
@@ -409,7 +469,6 @@ app.get("/pair-ui", (req, res) => {
     <button id="pairBtn" onclick="pair()">Get Pairing Code</button>
 
     <h3 id="status"></h3>
-
     <pre id="result"></pre>
 
     <script>
@@ -433,6 +492,10 @@ app.get("/pair-ui", (req, res) => {
 
       async function pair() {
         const number = document.getElementById("number").value;
+        const btn = document.getElementById("pairBtn");
+
+        btn.disabled = true;
+        btn.innerText = "⏳ Generating...";
 
         const res = await fetch("/pair", {
           method: "POST",
@@ -441,12 +504,16 @@ app.get("/pair-ui", (req, res) => {
         });
 
         const data = await res.json();
+
         document.getElementById("result").innerText =
           JSON.stringify(data, null, 2);
+
+        btn.disabled = false;
+        btn.innerText = "Get Pairing Code";
       }
 
       checkStatus();
-      setInterval(checkStatus, 2000); // auto refresh
+      setInterval(checkStatus, 2000);
     </script>
   `);
 });
