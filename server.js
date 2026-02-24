@@ -518,6 +518,19 @@ app.get("/pair-ui", (req, res) => {
   `);
 });
 
+// reset-auth
+
+app.get("/reset-auth", async (req, res) => {
+  const fs = await import("fs");
+
+  try {
+    fs.rmSync("./auth", { recursive: true, force: true });
+    res.send("✅ Auth folder deleted. Restart service.");
+  } catch (err) {
+    res.send("❌ Failed: " + err.message);
+  }
+});
+
 /* =========================
    CLEAN SHUTDOWN
 ========================= */
