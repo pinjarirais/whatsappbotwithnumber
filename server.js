@@ -2,6 +2,7 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   downloadMediaMessage,
+  fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 
 import express from "express";
@@ -26,8 +27,7 @@ let pairingCode = null;
 /* =========================
    CONFIG
 ========================= */
-const N8N_WEBHOOK_URL =
-  "https://raisn8n.app.n8n.cloud/webhook/whatsapp-rag";
+const N8N_WEBHOOK_URL = "https://raisn8n.app.n8n.cloud/webhook/whatsapp-rag";
 
 const BOT_NAMES = ["yesbank bot", "yes bank bot", "ai response"];
 const BOT_NUMBER_FALLBACKS = ["65559051915364"];
@@ -108,6 +108,7 @@ async function safeParseResponse(response) {
 ========================= */
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth");
+  const { version } = await fetchLatestBaileysVersion();
 
   try {
     if (!ocrWorker) {
@@ -120,10 +121,12 @@ async function startWhatsApp() {
   }
 
   sock = makeWASocket({
+    version,
     auth: state,
     logger: P({ level: "silent" }),
     printQRInTerminal: false,
-    browser: ["Windows", "Chrome", "10"],
+    syncFullHistory: false,
+    // browser: ["Windows", "Chrome", "10"],
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -159,6 +162,8 @@ async function startWhatsApp() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
+    
+
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
@@ -166,14 +171,42 @@ async function startWhatsApp() {
     const isGroup = remoteJid.endsWith("@g.us");
 
     const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      "";
+      msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
     const lowerText = text.toLowerCase().trim();
 
-    const isYes = /^(yes|ha|haan|ok|okay|sure|hmm)$/i.test(lowerText);
-    const isNo = /^(no|nahi|na|cancel)$/i.test(lowerText);
+    const cleanedLowerText = lowerText.replace(/@\S+/g, "").trim();
+
+const isYes =
+  cleanedLowerText.startsWith("yes") ||
+  cleanedLowerText.startsWith("ha") ||
+  cleanedLowerText.startsWith("haan") ||
+  cleanedLowerText === "ok" ||
+  cleanedLowerText === "okay";
+
+const isNo =
+  cleanedLowerText.startsWith("no") ||
+  cleanedLowerText.startsWith("nahi") ||
+  cleanedLowerText.startsWith("cancel");
+
+  // console.log("🧹 cleanedLowerText:", cleanedLowerText);
+  // console.log("🟢 isYes:", isYes);
+
+  //   console.log("📩 Incoming message:", text);
+  //   console.log("📩 lowerText:", lowerText);
+
+  //   console.log("🟢 isYes:", isYes);
+  //   console.log("🔴 isNo:", isNo);
+
+    /* =========================
+   SAFETY: YES बिना STATE
+========================= */
+    if (isYes && !conversationState.has(remoteJid)) {
+      await sock.sendMessage(remoteJid, {
+        text: "🤖 Please ask a question first 🙂",
+      });
+      return;
+    }
 
     /* =========================
        CONFIRMATION HANDLING
@@ -182,6 +215,7 @@ async function startWhatsApp() {
       const state = conversationState.get(remoteJid);
 
       if (isYes) {
+        console.log("🔥 YES DETECTED from:", remoteJid);
         conversationState.delete(remoteJid);
 
         await processInQueue(remoteJid, async () => {
@@ -189,6 +223,12 @@ async function startWhatsApp() {
 
           try {
             await sock.sendPresenceUpdate("composing", remoteJid);
+
+            console.log("📤 Sending YES to n8n:", {
+              message: state.originalQuestion,
+              confirmed: true,
+              mode: "direct_ai",
+            });
 
             const response = await fetch(N8N_WEBHOOK_URL, {
               method: "POST",
@@ -198,7 +238,9 @@ async function startWhatsApp() {
                 type: "text",
                 language: detectLanguage(state.originalQuestion),
                 isGroup,
+
                 confirmed: true,
+                mode: "direct_ai", // ✅ MAGIC FLAG
               }),
             });
 
@@ -261,7 +303,7 @@ async function startWhatsApp() {
             msg,
             "buffer",
             {},
-            { logger: P({ level: "silent" }) }
+            { logger: P({ level: "silent" }) },
           );
 
           const {
@@ -288,8 +330,7 @@ async function startWhatsApp() {
             }),
           });
 
-          if (!response.ok)
-            throw new Error(`Webhook HTTP ${response.status}`);
+          if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
 
           const data = await safeParseResponse(response);
 
@@ -316,19 +357,18 @@ async function startWhatsApp() {
     const lowerFullText = text.toLowerCase();
 
     const nameMentioned = BOT_NAMES.some((name) =>
-      lowerFullText.includes("@" + name)
+      lowerFullText.includes("@" + name),
     );
 
     const numberMentioned = BOT_NUMBER_FALLBACKS.some((num) =>
-      lowerFullText.includes("@" + num)
+      lowerFullText.includes("@" + num),
     );
 
     const commandTriggered = BOT_COMMANDS.some((cmd) =>
-      lowerFullText.startsWith(cmd)
+      lowerFullText.startsWith(cmd),
     );
 
-    const isBotTriggered =
-      nameMentioned || numberMentioned || commandTriggered;
+    const isBotTriggered = nameMentioned || numberMentioned || commandTriggered;
 
     if (isGroup && !isBotTriggered) return;
 
@@ -364,21 +404,22 @@ async function startWhatsApp() {
           }),
         });
 
-        if (!response.ok)
-          throw new Error(`Webhook HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
 
         const data = await safeParseResponse(response);
 
         const botReply =
           data.reply || data.output || "🤖 No response generated.";
 
-          console.log("BOT REPLY:", botReply);
+        //console.log("🤖 RAW BOT REPLY:", botReply);
 
-        if (/would you like|do you want|should i|can i/i.test(botReply)) {
-          conversationState.set(remoteJid, {
-            originalQuestion: cleanText,
-          });
-        }
+        if (/would you like|knowledge base|search using my/i.test(botReply)) {
+  console.log("🧠 Conversation state SET for:", remoteJid);
+
+  conversationState.set(remoteJid, {
+    originalQuestion: cleanText,
+  });
+}
 
         await sock.sendMessage(remoteJid, { text: botReply });
       } catch {
