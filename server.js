@@ -3,10 +3,8 @@ import makeWASocket, {
   useMultiFileAuthState,
   downloadMediaMessage,
   fetchLatestBaileysVersion,
+  downloadContentFromMessage,
 } from "@whiskeysockets/baileys";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 import express from "express";
 import QRCode from "qrcode";
@@ -15,7 +13,7 @@ import fetch from "node-fetch";
 import cors from "cors";
 import { createWorker } from "tesseract.js";
 import https from "https";
-
+import { Buffer } from "buffer";
 
 /* ----------- */
 
@@ -38,8 +36,9 @@ let pairingCode = null;
 /* =========================
    CONFIG
 ========================= */
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
-//const N8N_WEBHOOK_URL = "https://clovertechnology.app.n8n.cloud/webhook/whatsapp-rag";
+//const N8N_WEBHOOK_URL = "https://57.159.24.110:5678/webhook/whatsapp-rag";
+const N8N_WEBHOOK_URL =
+  "https://clovertechnology.app.n8n.cloud/webhook/whatsapp-rag";
 
 const BOT_NAMES = ["yesbank bot", "yes bank bot", "ai response"];
 const BOT_NUMBER_FALLBACKS = ["65559051915364"];
@@ -125,12 +124,15 @@ async function startWhatsApp() {
   try {
     if (!ocrWorker) {
       console.log("🔤 Initializing OCR Worker...");
-      ocrWorker = await createWorker("eng+hin");
-      await ocrWorker.setParameters({ tessedit_pageseg_mode: 6 });      
 
+      ocrWorker = await createWorker("eng"); // ✅ ONLY THIS
+
+      await ocrWorker.setParameters({
+        tessedit_pageseg_mode: 6,
+      });
     }
   } catch (err) {
-    console.log("❌ OCR Worker Init Failed:", err.message);
+    console.error("❌ OCR INIT ERROR:", err.message);
   }
 
   sock = makeWASocket({
@@ -313,17 +315,17 @@ async function startWhatsApp() {
     /* =========================
        IMAGE HANDLING
     ========================= */
+
+    const messageContent = msg.message?.imageMessage
+      ? msg.message
+      : msg.message?.ephemeralMessage?.message ||
+        msg.message?.viewOnceMessage?.message ||
+        msg.message;
+
     if (msg.message.imageMessage) {
       if (!ocrWorker) {
         await sock.sendMessage(remoteJid, {
           text: "⚠️ OCR engine not available.",
-        });
-        return;
-      }
-
-      if (chatBusy.has(remoteJid)) {
-        await sock.sendMessage(remoteJid, {
-          text: "⏳ Processing previous request...",
         });
         return;
       }
@@ -334,13 +336,58 @@ async function startWhatsApp() {
         try {
           await sock.sendPresenceUpdate("composing", remoteJid);
 
-          const buffer = await downloadMediaMessage(
-            msg,
-            "buffer",
-            {},
-            { logger: P({ level: "silent" }) },
-          );
+          // ✅ STEP 1: function define
+          async function getImageBuffer(msg) {
+            const content =
+              msg.message?.imageMessage ||
+              msg.message?.ephemeralMessage?.message?.imageMessage ||
+              msg.message?.viewOnceMessage?.message?.imageMessage;
 
+            if (!content) {
+              throw new Error("No valid imageMessage found");
+            }
+
+            const stream = await downloadContentFromMessage(content, "image");
+
+            let buffer = Buffer.from([]);
+
+            for await (const chunk of stream) {
+              buffer = Buffer.concat([buffer, chunk]);
+            }
+
+            return buffer;
+          }
+
+          console.log("📦 MESSAGE TYPE:", Object.keys(msg.message));
+
+          // ✅ STEP 2: CALL function (THIS WAS MISSING)
+          let buffer;
+
+          for (let i = 0; i < 3; i++) {
+            try {
+              console.log(`📥 Download attempt: ${i + 1}`);
+
+              buffer = await getImageBuffer(msg);
+
+              if (buffer && buffer.length > 0) {
+                console.log("✅ Download success");
+                break;
+              }
+            } catch (err) {
+              console.log(`❌ Attempt ${i + 1} failed:`, err.message);
+
+              if (i === 2) throw err; // last attempt → throw
+            }
+          }
+
+          // ✅ STEP 3: now safe
+          console.log("📦 Buffer size:", buffer.length);
+
+          if (!buffer || buffer.length === 0) {
+            throw new Error("Empty image buffer");
+          }
+
+          // OCR
           const {
             data: { text },
           } = await ocrWorker.recognize(buffer);
@@ -349,33 +396,19 @@ async function startWhatsApp() {
 
           if (!extractedText) {
             await sock.sendMessage(remoteJid, {
-              text: "⚠️ No readable text found in image.",
+              text: "⚠️ No readable text found.",
             });
             return;
           }
 
-          const response = await fetch(N8N_WEBHOOK_URL, {
-            method: "POST",
-            agent: httpsAgent,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              message: extractedText,
-              type: "image",
-              language: detectLanguage(extractedText),
-              isGroup,
-            }),
+          await sock.sendMessage(remoteJid, {
+            text: "✅ OCR Success:\n" + extractedText,
           });
-
-          if (!response.ok) throw new Error(`Webhook HTTP ${response.status}`);
-
-          const data = await safeParseResponse(response);
+        } catch (err) {
+          console.error("❌ OCR ERROR:", err);
 
           await sock.sendMessage(remoteJid, {
-            text: data.reply || data.output || "🤖 No response.",
-          });
-        } catch {
-          await sock.sendMessage(remoteJid, {
-            text: "⚠️ Image OCR failed.",
+            text: "⚠️ OCR failed: " + err.message,
           });
         } finally {
           chatBusy.delete(remoteJid);
@@ -610,28 +643,6 @@ app.get("/reset-auth", async (req, res) => {
     res.send("❌ Failed: " + err.message);
   }
 });
-
-// disconnect whatsapp
-
-app.get("/disconnect", async (req, res) => {
-  try {
-    if (sock) {
-      await sock.logout();
-    }
-
-    res.json({
-      success: true,
-      message: "WhatsApp disconnected"
-    });
-
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
 
 /* =========================
    CLEAN SHUTDOWN
